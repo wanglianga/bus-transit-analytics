@@ -1,0 +1,12 @@
+services:
+  bus-analytics:
+    build: .
+    container_name: bus-transit-analytics
+    volumes:
+      - ./sample_data:/app/sample_data
+      - ./output:/app/output
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python main.py --generate-sample
+    stdin_open: true
+    tty: true
