@@ -15,6 +15,7 @@ class MetricsCalculator:
         swipe_df = cleaned_data['swipe']
         congestion_df = cleaned_data['congestion']
         complaint_df = cleaned_data['complaint']
+        skipped_stops_df = cleaned_data.get('skipped_stops', pd.DataFrame())
 
         metrics = {}
         metrics['inter_stop_time'] = self.calculate_inter_stop_time(stops_df)
@@ -26,7 +27,9 @@ class MetricsCalculator:
             congestion_df, stops_df
         )
         metrics['complaint_hotspots'] = self.identify_complaint_hotspots(complaint_df)
-        metrics['delay_analysis'] = self.analyze_delays(stops_df, schedule_df, congestion_df)
+        metrics['delay_analysis'] = self.analyze_delays(
+            stops_df, schedule_df, congestion_df, skipped_stops_df
+        )
         return metrics
 
     def calculate_inter_stop_time(self, stops_df):
@@ -229,15 +232,42 @@ class MetricsCalculator:
             'by_time': by_time
         }
 
-    def analyze_delays(self, stops_df, schedule_df, congestion_df):
+    def analyze_delays(self, stops_df, schedule_df, congestion_df, skipped_stops_df=None):
+        if skipped_stops_df is None:
+            skipped_stops_df = pd.DataFrame()
+
         on_time = self.calculate_on_time_rate(stops_df, schedule_df)
         detail = on_time['detail'].copy()
         detail['date'] = detail['arrival_time'].dt.date
         detail['hour'] = detail['arrival_time'].dt.hour
         delay_detail = detail[detail['is_late']].copy()
         delay_detail['delay_minutes'] = delay_detail['arrival_deviation'] / 60
-        cause_cols = ['stop_sequence', 'hour', 'is_interpolated', 'is_skipped', 'is_detour']
-        available_cols = [c for c in cause_cols if c in delay_detail.columns]
+
+        trip_extra = stops_df.groupby(
+            ['route_id', 'trip_id']
+        ).agg({
+            'is_detour': 'max',
+            'trip_has_skip': 'max',
+            'trip_skip_count': 'max',
+            'detour_reason': 'first'
+        }).reset_index()
+        detail = detail.merge(
+            trip_extra, on=['route_id', 'trip_id'], how='left', suffixes=('', '_trip')
+        )
+        if 'is_detour_trip' in detail.columns:
+            detail['is_detour'] = detail['is_detour_trip'].fillna(detail.get('is_detour', False))
+        if 'trip_has_skip_trip' in detail.columns:
+            detail['trip_has_skip'] = detail['trip_has_skip_trip'].fillna(
+                detail.get('trip_has_skip', False)
+            )
+        if 'trip_skip_count_trip' in detail.columns:
+            detail['trip_skip_count'] = detail['trip_skip_count_trip'].fillna(
+                detail.get('trip_skip_count', 0)
+            )
+
+        delay_detail = detail[detail['is_late']].copy()
+        delay_detail['delay_minutes'] = delay_detail['arrival_deviation'] / 60
+
         by_cause = {}
         by_cause['by_stop'] = delay_detail.groupby(
             ['route_id', 'stop_id', 'stop_sequence']
@@ -255,17 +285,53 @@ class MetricsCalculator:
             avg_delay=('delay_minutes', 'mean'),
             total_delay=('delay_minutes', 'sum')
         ).reset_index()
-        if 'is_detour' in delay_detail.columns:
-            by_cause['detour_delays'] = delay_detail[
-                delay_detail['is_detour'] == True
-            ].groupby('route_id').agg(
+
+        detour_mask = delay_detail.get('is_detour', False) == True
+        if detour_mask.any():
+            dd_grp = delay_detail[detour_mask].groupby('route_id').agg(
                 detour_delay_count=('delay_minutes', 'count'),
                 detour_avg_delay=('delay_minutes', 'mean'),
                 detour_total_delay=('delay_minutes', 'sum')
             ).reset_index()
-        if 'is_skipped' in delay_detail.columns:
-            skip_stops = detail[detail['is_skipped'] == True]
-            by_cause['skipped_summary'] = skip_stops.groupby(
+            trip_detour_counts = trip_extra[trip_extra['is_detour'] == True].groupby(
+                'route_id'
+            ).size().reset_index(name='detour_trip_count')
+            dd_grp = dd_grp.merge(trip_detour_counts, on='route_id', how='left')
+            by_cause['detour_delays'] = dd_grp
+
+        if not skipped_stops_df.empty:
+            skip_summary = skipped_stops_df.groupby(
                 ['route_id', 'stop_id', 'stop_sequence']
             ).agg(skip_count=('trip_id', 'count')).reset_index()
+            by_cause['skipped_summary'] = skip_summary
+
+            skip_by_route = skipped_stops_df.groupby('route_id').agg(
+                skipped_stop_event_count=('trip_id', 'count'),
+                affected_trip_count=('trip_id', 'nunique')
+            ).reset_index()
+            skip_delay_routes = []
+            for _, sr in skip_by_route.iterrows():
+                rd = delay_detail[delay_detail['route_id'] == sr['route_id']]
+                skip_trips = detail[
+                    (detail['route_id'] == sr['route_id']) &
+                    (detail.get('trip_has_skip', False) == True)
+                ]['trip_id'].unique()
+                skip_late = delay_detail[
+                    (delay_detail['route_id'] == sr['route_id']) &
+                    (delay_detail['trip_id'].isin(skip_trips))
+                ]
+                skip_delay_routes.append({
+                    'route_id': sr['route_id'],
+                    'skipped_stop_event_count': int(sr['skipped_stop_event_count']),
+                    'affected_trip_count': int(sr['affected_trip_count']),
+                    'skip_related_delay_count': int(len(skip_late)),
+                    'skip_related_total_delay_min': round(
+                        skip_late['delay_minutes'].sum(), 1
+                    ) if len(skip_late) else 0,
+                    'skip_related_avg_delay_min': round(
+                        skip_late['delay_minutes'].mean(), 1
+                    ) if len(skip_late) else 0
+                })
+            by_cause['skip_route_summary'] = pd.DataFrame(skip_delay_routes)
+
         return by_cause

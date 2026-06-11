@@ -81,23 +81,26 @@ class BottleneckAnalyzer:
                         }
                     })
         if 'load_factor' in metrics and 'summary' in metrics['load_factor']:
-            load_stops = metrics['load_factor']['summary'][
-                metrics['load_factor']['summary']['route_id'] == route_id
-            ].copy()
-            overloaded = load_stops[load_stops['load_level'].isin(['high', 'overloaded'])]
-            for _, row in overloaded.iterrows():
-                bottlenecks.append({
-                    'stop_id': row['stop_id'],
-                    'stop_sequence': int(row['stop_sequence']),
-                    'bottleneck_type': 'high_passenger_load',
-                    'severity_score': min(row['avg_passengers'] / 2, 100),
-                    'metrics': {
-                        'hour': int(row['hour']),
-                        'avg_passengers': round(row['avg_passengers'], 1),
-                        'max_passengers': int(row['max_passengers']),
-                        'load_level': row['load_level']
-                    }
-                })
+            ls = metrics['load_factor']['summary']
+            if 'route_id' in ls.columns:
+                load_stops = ls[ls['route_id'] == route_id].copy()
+            else:
+                load_stops = pd.DataFrame()
+            if not load_stops.empty:
+                overloaded = load_stops[load_stops['load_level'].isin(['high', 'overloaded'])]
+                for _, row in overloaded.iterrows():
+                    bottlenecks.append({
+                        'stop_id': row['stop_id'],
+                        'stop_sequence': int(row['stop_sequence']),
+                        'bottleneck_type': 'high_passenger_load',
+                        'severity_score': min(row['avg_passengers'] / 2, 100),
+                        'metrics': {
+                            'hour': int(row['hour']),
+                            'avg_passengers': round(row['avg_passengers'], 1),
+                            'max_passengers': int(row['max_passengers']),
+                            'load_level': row['load_level']
+                        }
+                    })
         if 'inter_stop_time' in metrics and 'summary' in metrics['inter_stop_time']:
             ist = metrics['inter_stop_time']['summary'][
                 metrics['inter_stop_time']['summary']['route_id'] == route_id
@@ -145,17 +148,34 @@ class BottleneckAnalyzer:
                     da['detour_delays']['route_id'] == route_id
                 ]
                 if not detour_data.empty:
-                    breakdown['detour_and_route_deviation'] = \
-                        detour_data['detour_total_delay'].sum()
-                    detail_counts['detour_events'] = int(
-                        detour_data['detour_delay_count'].sum()
-                    )
-            if 'skipped_summary' in da:
+                    detour_delay = float(detour_data['detour_total_delay'].sum())
+                    detour_trips = int(detour_data.get('detour_trip_count', 0).sum())
+                    detour_events = int(detour_data['detour_delay_count'].sum())
+                    breakdown['detour_and_route_deviation'] = detour_delay + detour_trips * 10
+                    detail_counts['detour_events'] = detour_events
+                    detail_counts['detour_trip_count'] = detour_trips
+            if 'skip_route_summary' in da:
+                sr = da['skip_route_summary'][
+                    da['skip_route_summary']['route_id'] == route_id
+                ]
+                if not sr.empty:
+                    row = sr.iloc[0]
+                    skip_delay = float(row.get('skip_related_total_delay_min', 0))
+                    skip_events = int(row.get('skipped_stop_event_count', 0))
+                    affected_trips = int(row.get('affected_trip_count', 0))
+                    skip_weighted = skip_delay + skip_events * 15
+                    breakdown['skipped_stops'] = skip_weighted
+                    detail_counts['skipped_stop_events'] = skip_events
+                    detail_counts['skipped_affected_trips'] = affected_trips
+                    detail_counts['skip_related_delay_min'] = skip_delay
+            if 'skipped_summary' in da and 'skipped_stop_events' not in detail_counts:
                 skip_data = da['skipped_summary'][
                     da['skipped_summary']['route_id'] == route_id
                 ]
                 if not skip_data.empty:
-                    detail_counts['skipped_stop_events'] = int(skip_data['skip_count'].sum())
+                    cnt = int(skip_data['skip_count'].sum())
+                    breakdown['skipped_stops'] = cnt * 15
+                    detail_counts['skipped_stop_events'] = cnt
         if 'congested_segments' in metrics and not metrics['congested_segments'].empty:
             cs = metrics['congested_segments']
             congested = cs[cs['is_congested'] == True]
@@ -225,7 +245,7 @@ class BottleneckAnalyzer:
         if 'load_factor' in metrics and 'summary' in metrics['load_factor']:
             lf = metrics['load_factor']['summary'][
                 metrics['load_factor']['summary']['route_id'] == route_id
-            ].copy()
+            ].copy() if 'route_id' in metrics['load_factor']['summary'].columns else pd.DataFrame()
             if not lf.empty:
                 overloaded = lf[lf['load_level'].isin(['high', 'overloaded'])]
                 if not overloaded.empty:
@@ -244,18 +264,42 @@ class BottleneckAnalyzer:
             dd = metrics['delay_analysis']['detour_delays']
             if isinstance(dd, pd.DataFrame) and not dd.empty:
                 detour_route = dd[dd['route_id'] == route_id]
-                if not detour_route.empty and detour_route.iloc[0]['detour_delay_count'] > 5:
-                    suggestions.append({
-                        'suggestion_type': 'route_optimization',
-                        'priority': 'medium',
-                        'action': '分析绕行频发路段，评估临时绕行对准点率的影响，考虑常态化优化线路走向',
-                        'details': {
-                            'detour_event_count': int(detour_route.iloc[0]['detour_delay_count']),
-                            'avg_detour_delay_min': round(
-                                detour_route.iloc[0]['detour_avg_delay'], 1
-                            )
-                        }
-                    })
+                if not detour_route.empty:
+                    r0 = detour_route.iloc[0]
+                    trip_count = int(r0.get('detour_trip_count', 0))
+                    delay_count = int(r0['detour_delay_count'])
+                    if trip_count >= 1 or delay_count >= 1:
+                        suggestions.append({
+                            'suggestion_type': 'route_optimization',
+                            'priority': 'high' if trip_count >= 3 else 'medium',
+                            'action': '分析绕行频发路段，评估临时绕行对准点率的影响，考虑常态化优化线路走向',
+                            'details': {
+                                'detour_trip_count': trip_count,
+                                'detour_delay_event_count': delay_count,
+                                'avg_detour_delay_min': round(float(r0['detour_avg_delay']), 1)
+                            }
+                        })
+        if 'delay_analysis' in metrics and 'skip_route_summary' in metrics['delay_analysis']:
+            srs = metrics['delay_analysis']['skip_route_summary']
+            if isinstance(srs, pd.DataFrame) and not srs.empty:
+                skip_route = srs[srs['route_id'] == route_id]
+                if not skip_route.empty:
+                    r0 = skip_route.iloc[0]
+                    skip_events = int(r0.get('skipped_stop_event_count', 0))
+                    affected = int(r0.get('affected_trip_count', 0))
+                    if skip_events >= 1:
+                        suggestions.append({
+                            'suggestion_type': 'skip_stop_regulation',
+                            'priority': 'high' if skip_events >= 3 else 'medium',
+                            'action': '跳站事件频发，需开展司机规范停靠培训并安装站点到离站自动上报系统',
+                            'details': {
+                                'skipped_stop_event_count': skip_events,
+                                'affected_trip_count': affected,
+                                'skip_related_delay_min': round(
+                                    float(r0.get('skip_related_total_delay_min', 0)), 1
+                                )
+                            }
+                        })
         if on_time_rate is not None and on_time_rate < self.on_time_rate_threshold:
             suggestions.append({
                 'suggestion_type': 'schedule_adjustment',

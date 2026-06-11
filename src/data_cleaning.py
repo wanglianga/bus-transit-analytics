@@ -3,6 +3,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import warnings
 import math
+from collections import defaultdict
 warnings.filterwarnings('ignore')
 
 try:
@@ -32,23 +33,46 @@ def _distance_meters(p1, p2):
 
 
 class DataCleaner:
-    def __init__(self, gps_radius_threshold=50, speed_threshold=80):
+    def __init__(self, gps_radius_threshold=50, speed_threshold=80,
+                 skip_gap_runtime_factor=1.3, gps_deviation_meters=300,
+                 detour_unexpected_threshold=1):
         self.gps_radius_threshold = gps_radius_threshold
         self.speed_threshold = speed_threshold
+        self.skip_gap_runtime_factor = skip_gap_runtime_factor
+        self.gps_deviation_meters = gps_deviation_meters
+        self.detour_unexpected_threshold = detour_unexpected_threshold
         self.cleaning_report = {}
+        self.skipped_stops_list = pd.DataFrame()
 
     def clean_all(self, gps_data, stop_data, swipe_data, schedule_data,
                   congestion_data, complaint_data, holidays=None):
         self.cleaning_report = {}
+        self.skipped_stops_list = pd.DataFrame()
+
         gps_cleaned = self.clean_gps_drift(gps_data)
         stop_cleaned = self.clean_stop_records(stop_data, gps_cleaned)
-        stop_fixed = self.fix_missing_stops(stop_cleaned, schedule_data)
-        stop_fixed = self.detect_skipped_stops(stop_fixed, schedule_data)
+
+        analysis = self._analyze_gaps(stop_cleaned, schedule_data)
+        skip_df = analysis['skipped_stops']
+        miss_df = analysis['missing_stops']
+
+        self.skipped_stops_list = skip_df
+        self.cleaning_report['skipped_stops_total'] = len(skip_df)
+        self.cleaning_report['skipped_trips_with_skip'] = (
+            skip_df[['route_id', 'trip_id']].drop_duplicates().shape[0]
+            if len(skip_df) else 0
+        )
+        self.cleaning_report['missing_stops_to_interpolate'] = len(miss_df)
+
+        stop_fixed = self._interpolate_missing_only(stop_cleaned, schedule_data, miss_df)
+        stop_fixed = self._mark_trip_flags(stop_fixed, skip_df)
+
         stop_fixed = self.detect_detour(stop_fixed, gps_cleaned, schedule_data)
         schedule_adjusted = self.adjust_holiday_schedule(schedule_data, holidays)
         swipe_cleaned = self.clean_swipe_data(swipe_data)
         congestion_cleaned = self.clean_congestion_data(congestion_data)
         complaint_cleaned = self.clean_complaint_data(complaint_data)
+
         return {
             'gps': gps_cleaned,
             'stops': stop_fixed,
@@ -56,8 +80,173 @@ class DataCleaner:
             'schedule': schedule_adjusted,
             'congestion': congestion_cleaned,
             'complaint': complaint_cleaned,
+            'skipped_stops': skip_df,
             'report': self.cleaning_report
         }
+
+    def _analyze_gaps(self, stop_data, schedule_data):
+        skipped_rows = []
+        missing_rows = []
+
+        route_ref = {}
+        for (route_id, direction), grp in schedule_data.groupby(['route_id', 'direction']):
+            sorted_seq = sorted(grp['stop_sequence'].unique())
+            stop_map = dict(zip(grp['stop_sequence'], grp['stop_id']))
+            route_ref[(route_id, direction)] = {
+                'sequences': sorted_seq,
+                'stop_map': stop_map
+            }
+
+        baseline = self._compute_segment_baseline(stop_data)
+
+        for (route_id, direction), grp in stop_data.groupby(['route_id', 'direction']):
+            key = (route_id, direction)
+            if key not in route_ref:
+                continue
+            ref = route_ref[key]
+
+            for trip_id, trip in grp.groupby('trip_id'):
+                actual = sorted(trip['stop_sequence'].unique().tolist())
+                if len(actual) < 2:
+                    continue
+
+                trip_by_seq = dict(zip(trip['stop_sequence'], trip.to_dict('records')))
+                expected_range = [s for s in ref['sequences']
+                                  if s >= actual[0] and s <= actual[-1]]
+
+                for i in range(len(actual) - 1):
+                    prev_seq, curr_seq = actual[i], actual[i + 1]
+                    gap_seqs = [s for s in range(prev_seq + 1, curr_seq)
+                                if s in expected_range]
+                    if not gap_seqs:
+                        continue
+
+                    prev_row = trip_by_seq[prev_seq]
+                    curr_row = trip_by_seq[curr_seq]
+                    actual_gap_secs = (
+                        pd.Timestamp(curr_row['arrival_time']) -
+                        pd.Timestamp(prev_row['departure_time'])
+                    ).total_seconds()
+
+                    normal_secs = baseline.get(
+                        (route_id, direction, prev_seq, curr_seq),
+                        180 * (curr_seq - prev_seq)
+                    )
+
+                    if actual_gap_secs < normal_secs * self.skip_gap_runtime_factor:
+                        for gs in gap_seqs:
+                            skipped_rows.append({
+                                'route_id': route_id,
+                                'direction': direction,
+                                'trip_id': trip_id,
+                                'stop_sequence': gs,
+                                'stop_id': ref['stop_map'].get(gs, f"UNKNOWN_{gs}"),
+                                'vehicle_id': prev_row.get('vehicle_id'),
+                                'gap_from': prev_seq,
+                                'gap_to': curr_seq,
+                                'actual_gap_secs': actual_gap_secs,
+                                'baseline_secs': normal_secs,
+                                'skip_reason': 'runtime_too_short_for_gap'
+                            })
+                    else:
+                        for gs in gap_seqs:
+                            missing_rows.append({
+                                'route_id': route_id,
+                                'direction': direction,
+                                'trip_id': trip_id,
+                                'stop_sequence': gs,
+                                'stop_id': ref['stop_map'].get(gs, f"UNKNOWN_{gs}"),
+                                'gap_from': prev_seq,
+                                'gap_to': curr_seq,
+                                'actual_gap_secs': actual_gap_secs,
+                                'baseline_secs': normal_secs
+                            })
+
+        return {
+            'skipped_stops': pd.DataFrame(skipped_rows),
+            'missing_stops': pd.DataFrame(missing_rows)
+        }
+
+    def _compute_segment_baseline(self, stop_data):
+        baseline = {}
+        df = stop_data.sort_values(['route_id', 'direction', 'trip_id', 'stop_sequence']).copy()
+        df['next_seq'] = df.groupby(['route_id', 'direction', 'trip_id'])['stop_sequence'].shift(-1)
+        df['next_arrival'] = df.groupby(['route_id', 'direction', 'trip_id'])['arrival_time'].shift(-1)
+        df['departure_time'] = pd.to_datetime(df['departure_time'])
+        df['next_arrival'] = pd.to_datetime(df['next_arrival'])
+        df['seg_secs'] = (df['next_arrival'] - df['departure_time']).dt.total_seconds()
+        valid = df.dropna(subset=['next_seq', 'seg_secs'])
+        valid = valid[valid['seg_secs'] > 0]
+        valid['next_seq'] = valid['next_seq'].astype(int)
+        grouped = valid.groupby(['route_id', 'direction', 'stop_sequence', 'next_seq'])
+        for (rid, dr, ss, ns), grp in grouped:
+            if len(grp) >= 2:
+                baseline[(rid, dr, ss, ns)] = grp['seg_secs'].median()
+            else:
+                baseline[(rid, dr, ss, ns)] = grp['seg_secs'].iloc[0]
+        return baseline
+
+    def _interpolate_missing_only(self, stop_data, schedule_data, missing_df):
+        df = stop_data.copy()
+        df['is_interpolated'] = False
+
+        if missing_df.empty:
+            self.cleaning_report['missing_stops_filled'] = 0
+            return df
+
+        filled = 0
+        for _, mrow in missing_df.iterrows():
+            trip_mask = (
+                (df['route_id'] == mrow['route_id']) &
+                (df['direction'] == mrow['direction']) &
+                (df['trip_id'] == mrow['trip_id'])
+            )
+            trip = df[trip_mask]
+            prev = trip[trip['stop_sequence'] < mrow['stop_sequence']].tail(1)
+            nxt = trip[trip['stop_sequence'] > mrow['stop_sequence']].head(1)
+            if prev.empty or nxt.empty:
+                continue
+
+            prev_row = prev.iloc[0]
+            nxt_row = nxt.iloc[0]
+
+            mid_arrival = pd.Timestamp(prev_row['departure_time']) + \
+                (pd.Timestamp(nxt_row['arrival_time']) - pd.Timestamp(prev_row['departure_time'])) / 2
+            mid_departure = mid_arrival + timedelta(seconds=30)
+
+            new_row = prev_row.copy()
+            new_row['stop_sequence'] = int(mrow['stop_sequence'])
+            new_row['stop_id'] = mrow['stop_id']
+            new_row['arrival_time'] = mid_arrival
+            new_row['departure_time'] = mid_departure
+            new_row['is_interpolated'] = True
+
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            filled += 1
+
+        self.cleaning_report['missing_stops_filled'] = filled
+        return df.sort_values(['route_id', 'trip_id', 'stop_sequence']).reset_index(drop=True)
+
+    def _mark_trip_flags(self, stop_data, skipped_df):
+        df = stop_data.copy()
+        df['trip_skip_count'] = 0
+        df['trip_has_skip'] = False
+
+        if skipped_df.empty:
+            return df
+
+        trip_counts = skipped_df.groupby(
+            ['route_id', 'trip_id']
+        ).size().reset_index(name='_count')
+
+        for _, tc in trip_counts.iterrows():
+            mask = (
+                (df['route_id'] == tc['route_id']) &
+                (df['trip_id'] == tc['trip_id'])
+            )
+            df.loc[mask, 'trip_skip_count'] = tc['_count']
+            df.loc[mask, 'trip_has_skip'] = True
+        return df
 
     def clean_gps_drift(self, gps_data):
         df = gps_data.copy()
@@ -66,6 +255,7 @@ class DataCleaner:
         df['prev_lat'] = df.groupby('vehicle_id')['latitude'].shift(1)
         df['prev_lon'] = df.groupby('vehicle_id')['longitude'].shift(1)
         df['prev_ts'] = df.groupby('vehicle_id')['timestamp'].shift(1)
+
         def calc_speed(row):
             if pd.isna(row['prev_lat']) or pd.isna(row['prev_ts']):
                 return 0
@@ -73,8 +263,9 @@ class DataCleaner:
                 (row['prev_lat'], row['prev_lon']),
                 (row['latitude'], row['longitude'])
             )
-            time_diff = (row['timestamp'] - row['prev_ts']).total_seconds() / 3600
+            time_diff = (pd.Timestamp(row['timestamp']) - pd.Timestamp(row['prev_ts'])).total_seconds() / 3600
             return dist / time_diff if time_diff > 0 else 999
+
         df['speed_kmh'] = df.apply(calc_speed, axis=1)
         df['distance_from_prev'] = df.apply(
             lambda r: _distance_meters(
@@ -110,108 +301,91 @@ class DataCleaner:
         self.cleaning_report['invalid_stop_records_removed'] = original_count - len(df)
         return df.reset_index(drop=True)
 
-    def fix_missing_stops(self, stop_data, schedule_data):
-        df = stop_data.copy()
-        missing_count = 0
-        for (route_id, direction), grp in df.groupby(['route_id', 'direction']):
-            route_stops = schedule_data[
-                (schedule_data['route_id'] == route_id) &
-                (schedule_data['direction'] == direction)
-            ]['stop_sequence'].unique()
-            route_stops = sorted(route_stops)
-            for trip_id, trip in grp.groupby('trip_id'):
-                actual_stops = sorted(trip['stop_sequence'].unique())
-                expected = [s for s in route_stops
-                            if s >= min(actual_stops) and s <= max(actual_stops)]
-                missing = [s for s in expected if s not in actual_stops]
-                missing_count += len(missing)
-                for stop_seq in missing:
-                    prev_stop = trip[trip['stop_sequence'] < stop_seq].tail(1)
-                    next_stop = trip[trip['stop_sequence'] > stop_seq].head(1)
-                    if len(prev_stop) > 0 and len(next_stop) > 0:
-                        prev_row = prev_stop.iloc[0]
-                        next_row = next_stop.iloc[0]
-                        mid_arrival = prev_row['departure_time'] + \
-                            (next_row['arrival_time'] - prev_row['departure_time']) / 2
-                        mid_departure = mid_arrival + timedelta(seconds=30)
-                        new_row = prev_row.copy()
-                        new_row['stop_sequence'] = stop_seq
-                        new_row['stop_id'] = schedule_data[
-                            (schedule_data['route_id'] == route_id) &
-                            (schedule_data['direction'] == direction) &
-                            (schedule_data['stop_sequence'] == stop_seq)
-                        ]['stop_id'].values[0]
-                        new_row['arrival_time'] = mid_arrival
-                        new_row['departure_time'] = mid_departure
-                        new_row['is_interpolated'] = True
-                        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        df['is_interpolated'] = df.get('is_interpolated', False)
-        self.cleaning_report['missing_stops_filled'] = missing_count
-        return df.sort_values(['route_id', 'trip_id', 'stop_sequence']).reset_index(drop=True)
-
-    def detect_skipped_stops(self, stop_data, schedule_data):
-        df = stop_data.copy()
-        skip_records = []
-        for (route_id, direction), grp in df.groupby(['route_id', 'direction']):
-            route_stops = schedule_data[
-                (schedule_data['route_id'] == route_id) &
-                (schedule_data['direction'] == direction)
-            ]['stop_sequence'].unique()
-            route_stops = sorted(route_stops)
-            for trip_id, trip in grp.groupby('trip_id'):
-                actual_stops = sorted(trip['stop_sequence'].unique())
-                skipped = []
-                for i in range(len(actual_stops) - 1):
-                    gap = actual_stops[i + 1] - actual_stops[i]
-                    if gap > 1:
-                        for s in range(actual_stops[i] + 1, actual_stops[i + 1]):
-                            if s in route_stops:
-                                skipped.append(s)
-                for s in skipped:
-                    skip_records.append({
-                        'route_id': route_id,
-                        'trip_id': trip_id,
-                        'stop_sequence': s,
-                        'direction': direction,
-                        'is_skipped': True
-                    })
-        if skip_records:
-            skip_df = pd.DataFrame(skip_records)
-            df = df.merge(
-                skip_df[['route_id', 'trip_id', 'stop_sequence', 'direction', 'is_skipped']],
-                on=['route_id', 'trip_id', 'stop_sequence', 'direction'],
-                how='left'
-            )
-        else:
-            df['is_skipped'] = False
-        df['is_skipped'] = df['is_skipped'].fillna(False)
-        self.cleaning_report['skipped_stops_detected'] = int(df['is_skipped'].sum())
-        return df
-
     def detect_detour(self, stop_data, gps_data, schedule_data):
         df = stop_data.copy()
         df['is_detour'] = False
-        detour_count = 0
+        df['detour_reason'] = ''
+
         route_stop_info = {}
         for (route_id, direction), grp in schedule_data.groupby(['route_id', 'direction']):
-            route_stop_info[(route_id, direction)] = dict(zip(grp['stop_sequence'], grp['stop_id']))
+            if 'latitude' in grp.columns and 'longitude' in grp.columns:
+                coords = grp[['latitude', 'longitude']].values.tolist()
+            else:
+                coords = []
+            route_stop_info[(route_id, direction)] = {
+                'stop_ids': set(grp['stop_id'].unique()),
+                'stop_coords': coords
+            }
+
+        vehicle_trip_gps = defaultdict(list)
+        if not gps_data.empty and 'vehicle_id' in gps_data.columns:
+            gps_sorted = gps_data.sort_values(['vehicle_id', 'timestamp'])
+            for _, g in gps_sorted.iterrows():
+                vehicle_trip_gps[g['vehicle_id']].append(
+                    (float(g['latitude']), float(g['longitude']), pd.Timestamp(g['timestamp']))
+                )
+
+        detour_trips = 0
+        detour_by_unexpected_stop = 0
+        detour_by_gps_deviation = 0
+
         for (route_id, direction, trip_id), trip_stops in df.groupby(
                 ['route_id', 'direction', 'trip_id']):
             key = (route_id, direction)
             if key not in route_stop_info:
                 continue
-            expected_ids = set(route_stop_info[key].values())
-            actual_ids = set(trip_stops['stop_id'].unique())
+
+            expected_ids = route_stop_info[key]['stop_ids']
+            actual_ids = set(trip_stops['stop_id'].dropna().unique())
             unexpected = actual_ids - expected_ids
-            if len(unexpected) > 2:
-                df.loc[
+            has_unexpected = len(unexpected) >= self.detour_unexpected_threshold
+
+            has_gps_deviation = False
+            ref_coords = route_stop_info[key]['stop_coords']
+            if ref_coords and len(trip_stops) > 0:
+                vid = trip_stops.iloc[0].get('vehicle_id')
+                t_start = pd.Timestamp(trip_stops.iloc[0]['arrival_time'])
+                t_end = pd.Timestamp(trip_stops.iloc[-1]['departure_time'])
+                trip_gps = [
+                    (lat, lon, ts) for (lat, lon, ts) in vehicle_trip_gps.get(vid, [])
+                    if t_start <= ts <= t_end
+                ]
+                if trip_gps:
+                    deviations = []
+                    for lat, lon, _ in trip_gps:
+                        min_dist = min(
+                            (_distance_meters((lat, lon), (c[0], c[1])) for c in ref_coords),
+                            default=self.gps_deviation_meters * 2
+                        )
+                        deviations.append(min_dist)
+                    if deviations:
+                        ratio = sum(
+                            1 for d in deviations if d > self.gps_deviation_meters
+                        ) / len(deviations)
+                        if ratio >= 0.3:
+                            has_gps_deviation = True
+
+            is_trip_detour = has_unexpected or has_gps_deviation
+            if is_trip_detour:
+                mask = (
                     (df['route_id'] == route_id) &
                     (df['trip_id'] == trip_id) &
-                    (df['direction'] == direction),
-                    'is_detour'
-                ] = True
-                detour_count += 1
-        self.cleaning_report['detour_trips_detected'] = detour_count
+                    (df['direction'] == direction)
+                )
+                df.loc[mask, 'is_detour'] = True
+                reasons = []
+                if has_unexpected:
+                    reasons.append(f"unexpected_stops[{len(unexpected)}]")
+                    detour_by_unexpected_stop += 1
+                if has_gps_deviation:
+                    reasons.append(f"gps_deviation[ratio>30%]")
+                    detour_by_gps_deviation += 1
+                df.loc[mask, 'detour_reason'] = ','.join(reasons)
+                detour_trips += 1
+
+        self.cleaning_report['detour_trips_detected'] = detour_trips
+        self.cleaning_report['detour_by_unexpected_stop'] = detour_by_unexpected_stop
+        self.cleaning_report['detour_by_gps_deviation'] = detour_by_gps_deviation
         return df
 
     def adjust_holiday_schedule(self, schedule_data, holidays=None):
