@@ -28,6 +28,7 @@ def generate_sample_data(output_dir='sample_data'):
             'vehicles': ['V20201', 'V20202', 'V20203']
         }
     }
+    weather_records = []
     stops_info = {}
     for route_id in routes:
         cfg = route_config[route_id]
@@ -53,11 +54,31 @@ def generate_sample_data(output_dir='sample_data'):
     congestion_records = []
     complaint_records = []
     base_date = datetime(2025, 10, 13)
-    service_days = 7
+    service_days = 14
     complaint_id = 1
+    daily_weather = {}
     for day in range(service_days):
         current_date = base_date + timedelta(days=day)
+        date_str = current_date.strftime('%Y-%m-%d')
+        is_rainy = random.random() < 0.3
+        rain_intensity = random.choice(['light', 'moderate', 'heavy']) if is_rainy else 'none'
+        daily_weather[date_str] = {
+            'is_rainy': is_rainy,
+            'rain_intensity': rain_intensity
+        }
+        weather_records.append({
+            'date': date_str,
+            'weather': 'rainy' if is_rainy else 'sunny',
+            'rain_intensity': rain_intensity,
+            'avg_temp': random.uniform(15, 28),
+            'humidity': random.uniform(50, 95) if is_rainy else random.uniform(40, 70)
+        })
+    for day in range(service_days):
+        current_date = base_date + timedelta(days=day)
+        date_str = current_date.strftime('%Y-%m-%d')
         is_weekend = current_date.weekday() >= 5
+        is_rainy = daily_weather[date_str]['is_rainy']
+        rain_intensity = daily_weather[date_str]['rain_intensity']
         for route_id in routes:
             cfg = route_config[route_id]
             for direction in directions:
@@ -84,13 +105,27 @@ def generate_sample_data(output_dir='sample_data'):
                     })
                     current_time = start_time
                     gps_time = start_time
+                    rain_run_factor = 1.0
+                    rain_dwell_factor = 1.0
+                    if is_rainy:
+                        if rain_intensity == 'light':
+                            rain_run_factor = 1.15
+                            rain_dwell_factor = 1.1
+                        elif rain_intensity == 'moderate':
+                            rain_run_factor = 1.3
+                            rain_dwell_factor = 1.2
+                        elif rain_intensity == 'heavy':
+                            rain_run_factor = 1.5
+                            rain_dwell_factor = 1.3
                     for _, stop_row in stops_df.iterrows():
                         run_seconds = random.randint(90, 240)
                         if 7 <= start_hour <= 9 or 17 <= start_hour <= 19:
                             run_seconds += random.randint(60, 180)
+                        run_seconds = int(run_seconds * rain_run_factor)
                         dwell_seconds = random.randint(15, 60)
                         if random.random() < 0.05:
                             dwell_seconds += random.randint(60, 180)
+                        dwell_seconds = int(dwell_seconds * rain_dwell_factor)
                         arrival_time = current_time + timedelta(seconds=run_seconds)
                         departure_time = arrival_time + timedelta(seconds=dwell_seconds)
                         if random.random() < 0.03 and _ > 0:
@@ -113,6 +148,10 @@ def generate_sample_data(output_dir='sample_data'):
                                 boarding = random.randint(10, 45)
                             else:
                                 boarding = random.randint(2, 20)
+                            if is_rainy:
+                                boarding = int(boarding * 1.2)
+                                if rain_intensity in ['moderate', 'heavy']:
+                                    boarding = int(boarding * 1.1)
                             for p in range(boarding):
                                 swipe_time = arrival_time + timedelta(
                                     seconds=random.randint(5, dwell_seconds - 5)
@@ -166,11 +205,19 @@ def generate_sample_data(output_dir='sample_data'):
                         current_time = departure_time
     for day in range(service_days):
         current_date = base_date + timedelta(days=day)
+        date_str = current_date.strftime('%Y-%m-%d')
+        day_is_rainy = daily_weather[date_str]['is_rainy']
+        day_rain_intensity = daily_weather[date_str]['rain_intensity']
         for hour in range(6, 22):
             for seg in range(1, 21):
                 congestion = np.random.exponential(3)
                 if hour in [7, 8, 9, 17, 18, 19]:
                     congestion += random.uniform(2, 5)
+                if day_is_rainy:
+                    rain_factor = 1.2 if day_rain_intensity == 'light' else (
+                        1.4 if day_rain_intensity == 'moderate' else 1.6
+                    )
+                    congestion *= rain_factor
                 congestion = min(congestion, 10)
                 congestion_records.append({
                     'road_segment_id': f"SEG{seg:03d}",
@@ -180,20 +227,32 @@ def generate_sample_data(output_dir='sample_data'):
                 })
     complaint_types = [
         '晚点严重', '车辆拥挤', '越站不停', '司机服务态度',
-        '车厢卫生', '空调故障', '停靠不规范', '绕行未告知'
+        '车厢卫生', '空调故障', '停靠不规范', '绕行未告知',
+        '雨天车厢湿滑', '雨天等车太久'
     ]
-    for _ in range(60):
+    rainy_complaint_types = ['晚点严重', '车辆拥挤', '雨天等车太久', '雨天车厢湿滑', '停靠不规范']
+    total_complaints = 100
+    for _ in range(total_complaints):
         route_id = random.choice(routes)
-        c_type = random.choice(complaint_types)
         day_offset = random.randint(0, service_days - 1)
         c_date = base_date + timedelta(days=day_offset)
+        date_str = c_date.strftime('%Y-%m-%d')
+        day_is_rainy = daily_weather[date_str]['is_rainy']
+        if day_is_rainy and random.random() < 0.6:
+            c_type = random.choice(rainy_complaint_types)
+        else:
+            c_type = random.choice(complaint_types)
+        if day_is_rainy:
+            c_hour = random.choice([7, 8, 9, 17, 18, 19])
+        else:
+            c_hour = random.choice([7, 8, 9, 12, 17, 18, 19])
         complaint_records.append({
             'complaint_id': f"CP{complaint_id:05d}",
             'route_id': route_id,
             'stop_id': random.choice(list(stops_info.keys())),
             'complaint_type': c_type,
             'complaint_time': c_date.replace(
-                hour=random.choice([7, 8, 9, 17, 18, 19, 12]),
+                hour=c_hour,
                 minute=random.randint(0, 59)
             ),
             'description': f"乘客反映{c_type}",
@@ -209,12 +268,14 @@ def generate_sample_data(output_dir='sample_data'):
     schedule_df = pd.DataFrame([r for r in schedule_records if 'stop_id' in r])
     congestion_df = pd.DataFrame(congestion_records)
     complaint_df = pd.DataFrame(complaint_records)
+    weather_df = pd.DataFrame(weather_records)
     gps_df.to_csv(f'{output_dir}/gps_data.csv', index=False)
     stops_df.to_csv(f'{output_dir}/stop_data.csv', index=False)
     swipe_df.to_csv(f'{output_dir}/swipe_data.csv', index=False)
     schedule_df.to_csv(f'{output_dir}/schedule_data.csv', index=False)
     congestion_df.to_csv(f'{output_dir}/congestion_data.csv', index=False)
     complaint_df.to_csv(f'{output_dir}/complaint_data.csv', index=False)
+    weather_df.to_csv(f'{output_dir}/weather_data.csv', index=False)
     print(f"数据生成完成，保存到 {output_dir}/ 目录")
     print(f"  GPS 轨迹: {len(gps_df)} 条")
     print(f"  站点记录: {len(stops_df)} 条")
@@ -222,13 +283,15 @@ def generate_sample_data(output_dir='sample_data'):
     print(f"  班次计划: {len(schedule_df)} 条")
     print(f"  拥堵指数: {len(congestion_df)} 条")
     print(f"  投诉记录: {len(complaint_df)} 条")
+    print(f"  天气记录: {len(weather_df)} 条")
     return {
         'gps': gps_df,
         'stops': stops_df,
         'swipe': swipe_df,
         'schedule': schedule_df,
         'congestion': congestion_df,
-        'complaint': complaint_df
+        'complaint': complaint_df,
+        'weather': weather_df
     }
 
 

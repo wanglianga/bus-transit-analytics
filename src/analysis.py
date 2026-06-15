@@ -24,6 +24,12 @@ class BottleneckAnalyzer:
             route_result['dispatch_suggestions'] = self.generate_dispatch_suggestions(
                 metrics, route_id
             )
+            route_result['period_segment_comparison'] = self.analyze_period_segment_comparison(
+                metrics, route_id
+            )
+            route_result['rainy_day_analysis'] = self.analyze_rainy_day_impact(
+                metrics, route_id
+            )
             results[route_id] = route_result
         return results
 
@@ -333,5 +339,271 @@ class BottleneckAnalyzer:
                 'action': '当前线路运行状况良好，保持现有调度策略，持续监控关键指标',
                 'details': {}
             })
+        if 'rainy_day_comparison' in metrics and metrics['rainy_day_comparison'].get('has_data', False):
+            rainy = metrics['rainy_day_comparison']
+            if 'inter_stop_time_diff' in rainy and not rainy['inter_stop_time_diff'].empty:
+                ist_diff = rainy['inter_stop_time_diff'][
+                    rainy['inter_stop_time_diff']['route_id'] == route_id
+                ]
+                if not ist_diff.empty:
+                    max_time_increase = ist_diff['avg_time_increase_pct'].max()
+                    if max_time_increase >= 15:
+                        suggestions.append({
+                            'suggestion_type': 'rainy_day_extra_service',
+                            'priority': 'high' if max_time_increase >= 25 else 'medium',
+                            'action': (
+                                f"雨天站间耗时增加{round(max_time_increase, 1)}%，"
+                                f"建议在雨天临时加密班次，缓解延误和拥挤"
+                            ),
+                            'details': {
+                                'avg_time_increase_pct': round(max_time_increase, 1),
+                                'recommendation': 'add_trips_on_rainy_days'
+                            }
+                        })
+            if 'complaint_diff' in rainy and not rainy['complaint_diff'].empty:
+                comp_diff = rainy['complaint_diff'][
+                    rainy['complaint_diff']['route_id'] == route_id
+                ]
+                if not comp_diff.empty:
+                    comp_increase = comp_diff.iloc[0].get('complaint_increase_pct', 0)
+                    if comp_increase >= 30:
+                        suggestions.append({
+                            'suggestion_type': 'rainy_day_complaint_mitigation',
+                            'priority': 'medium',
+                            'action': (
+                                f"雨天投诉量增加{round(comp_increase, 1)}%，"
+                                f"建议加强雨天服务质量管控，增设雨天乘车指引"
+                            ),
+                            'details': {
+                                'complaint_increase_pct': round(comp_increase, 1)
+                            }
+                        })
+        if not suggestions:
+            suggestions.append({
+                'suggestion_type': 'maintain_current',
+                'priority': 'low',
+                'action': '当前线路运行状况良好，保持现有调度策略，持续监控关键指标',
+                'details': {}
+            })
         priority_order = {'high': 0, 'medium': 1, 'low': 2}
         return sorted(suggestions, key=lambda s: priority_order.get(s['priority'], 3))
+
+    def analyze_period_segment_comparison(self, metrics, route_id):
+        result = {
+            'segments': {},
+            'key_findings': []
+        }
+        if 'period_segment_analysis' not in metrics:
+            return result
+
+        psa = metrics['period_segment_analysis']
+        period_names = {
+            'morning_peak': '早高峰(7-9点)',
+            'evening_peak': '晚高峰(17-19点)',
+            'off_peak': '平峰时段',
+            'weekend': '周末'
+        }
+
+        if 'on_time_by_period' in psa and not psa['on_time_by_period'].empty:
+            ot = psa['on_time_by_period'][
+                psa['on_time_by_period']['route_id'] == route_id
+            ]
+            if not ot.empty:
+                on_time_data = {}
+                for _, row in ot.iterrows():
+                    seg = row['period_segment']
+                    on_time_data[seg] = {
+                        'on_time_rate': round(row['on_time_rate'], 4),
+                        'avg_deviation_minutes': round(row['avg_deviation_seconds'] / 60, 2),
+                        'late_count': int(row['late_count']),
+                        'total_count': int(row['total_count'])
+                    }
+                result['segments']['on_time_rate'] = on_time_data
+                if 'morning_peak' in on_time_data and 'off_peak' in on_time_data:
+                    morning_rate = on_time_data['morning_peak']['on_time_rate']
+                    offpeak_rate = on_time_data['off_peak']['on_time_rate']
+                    diff_pct = (offpeak_rate - morning_rate) * 100
+                    if diff_pct > 5:
+                        result['key_findings'].append(
+                            f"早高峰准点率比平峰低{round(diff_pct, 1)}个百分点，通勤时段拥堵影响显著"
+                        )
+                if 'evening_peak' in on_time_data and 'off_peak' in on_time_data:
+                    evening_rate = on_time_data['evening_peak']['on_time_rate']
+                    offpeak_rate = on_time_data['off_peak']['on_time_rate']
+                    diff_pct = (offpeak_rate - evening_rate) * 100
+                    if diff_pct > 5:
+                        result['key_findings'].append(
+                            f"晚高峰准点率比平峰低{round(diff_pct, 1)}个百分点，晚高峰延误问题突出"
+                        )
+
+        if 'inter_stop_time_by_period' in psa and not psa['inter_stop_time_by_period'].empty:
+            ist = psa['inter_stop_time_by_period'][
+                psa['inter_stop_time_by_period']['route_id'] == route_id
+            ]
+            if not ist.empty:
+                ist_data = {}
+                for _, row in ist.iterrows():
+                    seg = row['period_segment']
+                    ist_data[seg] = {
+                        'avg_run_time_sec': round(row['avg_run_time_sec'], 1),
+                        'p95_run_time_sec': round(row['p95_run_time_sec'], 1),
+                        'sample_count': int(row['sample_count'])
+                    }
+                result['segments']['inter_stop_time'] = ist_data
+
+        if 'load_factor_by_period' in psa and not psa['load_factor_by_period'].empty:
+            lf = psa['load_factor_by_period'][
+                psa['load_factor_by_period']['route_id'] == route_id
+            ]
+            if not lf.empty:
+                load_data = {}
+                for _, row in lf.iterrows():
+                    seg = row['period_segment']
+                    load_data[seg] = {
+                        'avg_hourly_passengers': round(row['avg_hourly_passengers'], 1),
+                        'max_hourly_passengers': int(row['max_hourly_passengers']),
+                        'total_passengers': int(row['total_passengers'])
+                    }
+                result['segments']['load_factor'] = load_data
+                if 'morning_peak' in load_data and 'off_peak' in load_data:
+                    morning_load = load_data['morning_peak']['avg_hourly_passengers']
+                    offpeak_load = load_data['off_peak']['avg_hourly_passengers']
+                    if offpeak_load > 0:
+                        ratio = morning_load / offpeak_load
+                        if ratio >= 1.5:
+                            result['key_findings'].append(
+                                f"早高峰客流是平峰的{round(ratio, 1)}倍，运力需求差异明显"
+                            )
+
+        if 'headway_by_period' in psa and not psa['headway_by_period'].empty:
+            hw = psa['headway_by_period'][
+                psa['headway_by_period']['route_id'] == route_id
+            ]
+            if not hw.empty:
+                headway_data = {}
+                for _, row in hw.iterrows():
+                    seg = row['period_segment']
+                    headway_data[seg] = {
+                        'avg_headway_minutes': round(row['avg_headway_sec'] / 60, 2),
+                        'headway_cv': round(row['headway_cv'], 3),
+                        'sample_count': int(row['sample_count'])
+                    }
+                result['segments']['headway'] = headway_data
+
+        result['period_names'] = period_names
+        return result
+
+    def analyze_rainy_day_impact(self, metrics, route_id):
+        result = {
+            'has_data': False,
+            'inter_stop_time_comparison': {},
+            'load_factor_comparison': {},
+            'complaint_comparison': {},
+            'congestion_comparison': {},
+            'summary': {},
+            'needs_rainy_extra_service': False,
+            'recommendations': []
+        }
+        if 'rainy_day_comparison' not in metrics:
+            return result
+        rainy = metrics['rainy_day_comparison']
+        if not rainy.get('has_data', False):
+            return result
+
+        result['has_data'] = True
+
+        if 'inter_stop_time_diff' in rainy and not rainy['inter_stop_time_diff'].empty:
+            ist_diff = rainy['inter_stop_time_diff'][
+                rainy['inter_stop_time_diff']['route_id'] == route_id
+            ]
+            if not ist_diff.empty:
+                row = ist_diff.iloc[0]
+                result['inter_stop_time_comparison'] = {
+                    'sunny_avg_sec': round(row['avg_run_time_sec_sunny'], 1),
+                    'rainy_avg_sec': round(row['avg_run_time_sec_rainy'], 1),
+                    'avg_time_increase_pct': round(row['avg_time_increase_pct'], 1),
+                    'p95_time_increase_pct': round(row['p95_time_increase_pct'], 1)
+                }
+                time_increase = row['avg_time_increase_pct']
+                if time_increase >= 20:
+                    result['recommendations'].append(
+                        '雨天运行时间显著增加，建议雨天加密班次20-30%'
+                    )
+                    result['needs_rainy_extra_service'] = True
+                elif time_increase >= 10:
+                    result['recommendations'].append(
+                        '雨天运行时间有所增加，建议重点时段临时增派车辆'
+                    )
+                if time_increase >= 15:
+                    result['summary']['severity'] = 'high'
+                elif time_increase >= 8:
+                    result['summary']['severity'] = 'medium'
+                else:
+                    result['summary']['severity'] = 'low'
+
+        if 'load_factor_diff' in rainy and not rainy['load_factor_diff'].empty:
+            load_diff = rainy['load_factor_diff'][
+                rainy['load_factor_diff']['route_id'] == route_id
+            ]
+            if not load_diff.empty:
+                row = load_diff.iloc[0]
+                result['load_factor_comparison'] = {
+                    'sunny_avg_hourly': round(row['avg_hourly_passengers_sunny'], 1),
+                    'rainy_avg_hourly': round(row['avg_hourly_passengers_rainy'], 1),
+                    'avg_load_increase_pct': round(row['avg_load_increase_pct'], 1)
+                }
+                load_increase = row['avg_load_increase_pct']
+                if load_increase >= 15:
+                    result['recommendations'].append(
+                        '雨天客流明显增加，需增加运力应对满载率上升'
+                    )
+                    if load_increase >= 20:
+                        result['needs_rainy_extra_service'] = True
+
+        if 'complaint_diff' in rainy and not rainy['complaint_diff'].empty:
+            comp_diff = rainy['complaint_diff'][
+                rainy['complaint_diff']['route_id'] == route_id
+            ]
+            if not comp_diff.empty:
+                row = comp_diff.iloc[0]
+                result['complaint_comparison'] = {
+                    'sunny_avg_daily': round(row['avg_daily_complaints_sunny'], 2),
+                    'rainy_avg_daily': round(row['avg_daily_complaints_rainy'], 2),
+                    'complaint_increase_pct': round(row['complaint_increase_pct'], 1)
+                }
+                comp_increase = row['complaint_increase_pct']
+                if comp_increase >= 30:
+                    result['recommendations'].append(
+                        '雨天投诉显著增加，需加强服务质量和安全提醒'
+                    )
+
+        if 'complaint_type_by_weather' in rainy and not rainy['complaint_type_by_weather'].empty:
+            ct = rainy['complaint_type_by_weather'][
+                rainy['complaint_type_by_weather']['route_id'] == route_id
+            ]
+            if not ct.empty:
+                rainy_types = ct[ct['is_rainy'] == True].sort_values(
+                    'complaint_count', ascending=False
+                )
+                if not rainy_types.empty:
+                    top_rainy_complaints = rainy_types.head(3)['complaint_type'].tolist()
+                    result['top_rainy_complaint_types'] = top_rainy_complaints
+
+        if 'congestion_by_weather' in rainy and not rainy['congestion_by_weather'].empty:
+            cw = rainy['congestion_by_weather']
+            sunny_cong = cw[cw['is_rainy'] == False]
+            rainy_cong = cw[cw['is_rainy'] == True]
+            if not sunny_cong.empty and not rainy_cong.empty:
+                result['congestion_comparison'] = {
+                    'sunny_avg_index': round(sunny_cong.iloc[0]['avg_congestion_index'], 2),
+                    'rainy_avg_index': round(rainy_cong.iloc[0]['avg_congestion_index'], 2),
+                    'sunny_severe_ratio': round(sunny_cong.iloc[0]['severe_ratio'] * 100, 1),
+                    'rainy_severe_ratio': round(rainy_cong.iloc[0]['severe_ratio'] * 100, 1)
+                }
+
+        if not result['recommendations']:
+            result['recommendations'].append(
+                '雨天对运营影响较小，维持现有调度策略，持续关注天气变化'
+            )
+
+        return result

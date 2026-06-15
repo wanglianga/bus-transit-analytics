@@ -45,12 +45,13 @@ class DataCleaner:
         self.skipped_stops_list = pd.DataFrame()
 
     def clean_all(self, gps_data, stop_data, swipe_data, schedule_data,
-                  congestion_data, complaint_data, holidays=None):
+                  congestion_data, complaint_data, weather_data=None, holidays=None):
         self.cleaning_report = {}
         self.skipped_stops_list = pd.DataFrame()
 
         gps_cleaned = self.clean_gps_drift(gps_data)
         stop_cleaned = self.clean_stop_records(stop_data, gps_cleaned)
+        weather_cleaned = self.clean_weather_data(weather_data)
 
         analysis = self._analyze_gaps(stop_cleaned, schedule_data)
         skip_df = analysis['skipped_stops']
@@ -68,10 +69,14 @@ class DataCleaner:
         stop_fixed = self._mark_trip_flags(stop_fixed, skip_df)
 
         stop_fixed = self.detect_detour(stop_fixed, gps_cleaned, schedule_data)
+        stop_fixed = self._merge_weather_to_stops(stop_fixed, weather_cleaned)
         schedule_adjusted = self.adjust_holiday_schedule(schedule_data, holidays)
         swipe_cleaned = self.clean_swipe_data(swipe_data)
+        swipe_cleaned = self._merge_weather_to_swipe(swipe_cleaned, weather_cleaned)
         congestion_cleaned = self.clean_congestion_data(congestion_data)
+        congestion_cleaned = self._merge_weather_to_congestion(congestion_cleaned, weather_cleaned)
         complaint_cleaned = self.clean_complaint_data(complaint_data)
+        complaint_cleaned = self._merge_weather_to_complaint(complaint_cleaned, weather_cleaned)
 
         return {
             'gps': gps_cleaned,
@@ -80,6 +85,7 @@ class DataCleaner:
             'schedule': schedule_adjusted,
             'congestion': congestion_cleaned,
             'complaint': complaint_cleaned,
+            'weather': weather_cleaned,
             'skipped_stops': skip_df,
             'report': self.cleaning_report
         }
@@ -427,3 +433,82 @@ class DataCleaner:
         df = df.dropna(subset=['complaint_time'])
         self.cleaning_report['invalid_complaint_records_removed'] = original_count - len(df)
         return df.reset_index(drop=True)
+
+    def clean_weather_data(self, weather_data):
+        if weather_data is None or weather_data.empty:
+            self.cleaning_report['weather_records'] = 0
+            return pd.DataFrame()
+        df = weather_data.copy()
+        original_count = len(df)
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df = df.dropna(subset=['date'])
+        if 'weather' not in df.columns:
+            df['weather'] = 'unknown'
+        if 'rain_intensity' not in df.columns:
+            df['rain_intensity'] = 'none'
+        df['is_rainy'] = df['weather'].str.lower().isin(['rain', 'rainy', '小雨', '中雨', '大雨', '暴雨'])
+        df['date_str'] = df['date'].dt.strftime('%Y-%m-%d')
+        self.cleaning_report['weather_records'] = len(df)
+        self.cleaning_report['rainy_days'] = int(df['is_rainy'].sum())
+        return df.reset_index(drop=True)
+
+    def _merge_weather_to_stops(self, stops_df, weather_df):
+        if stops_df.empty or weather_df.empty:
+            if 'is_rainy' not in stops_df.columns:
+                stops_df['is_rainy'] = False
+                stops_df['weather'] = 'unknown'
+                stops_df['rain_intensity'] = 'none'
+            return stops_df
+        df = stops_df.copy()
+        df['date_str'] = df['arrival_time'].dt.strftime('%Y-%m-%d')
+        weather_map = weather_df.set_index('date_str')
+        df['is_rainy'] = df['date_str'].map(weather_map['is_rainy']).fillna(False)
+        df['weather'] = df['date_str'].map(weather_map['weather']).fillna('unknown')
+        df['rain_intensity'] = df['date_str'].map(weather_map['rain_intensity']).fillna('none')
+        df = df.drop(columns=['date_str'])
+        return df
+
+    def _merge_weather_to_swipe(self, swipe_df, weather_df):
+        if swipe_df.empty or weather_df.empty:
+            if 'is_rainy' not in swipe_df.columns:
+                swipe_df['is_rainy'] = False
+                swipe_df['weather'] = 'unknown'
+            return swipe_df
+        df = swipe_df.copy()
+        df['date_str'] = df['swipe_time'].dt.strftime('%Y-%m-%d')
+        weather_map = weather_df.set_index('date_str')
+        df['is_rainy'] = df['date_str'].map(weather_map['is_rainy']).fillna(False)
+        df['weather'] = df['date_str'].map(weather_map['weather']).fillna('unknown')
+        df['rain_intensity'] = df['date_str'].map(weather_map['rain_intensity']).fillna('none')
+        df = df.drop(columns=['date_str'])
+        return df
+
+    def _merge_weather_to_congestion(self, congestion_df, weather_df):
+        if congestion_df.empty or weather_df.empty:
+            if 'is_rainy' not in congestion_df.columns:
+                congestion_df['is_rainy'] = False
+                congestion_df['weather'] = 'unknown'
+            return congestion_df
+        df = congestion_df.copy()
+        df['date_str'] = df['timestamp'].dt.strftime('%Y-%m-%d')
+        weather_map = weather_df.set_index('date_str')
+        df['is_rainy'] = df['date_str'].map(weather_map['is_rainy']).fillna(False)
+        df['weather'] = df['date_str'].map(weather_map['weather']).fillna('unknown')
+        df['rain_intensity'] = df['date_str'].map(weather_map['rain_intensity']).fillna('none')
+        df = df.drop(columns=['date_str'])
+        return df
+
+    def _merge_weather_to_complaint(self, complaint_df, weather_df):
+        if complaint_df.empty or weather_df.empty:
+            if 'is_rainy' not in complaint_df.columns:
+                complaint_df['is_rainy'] = False
+                complaint_df['weather'] = 'unknown'
+            return complaint_df
+        df = complaint_df.copy()
+        df['date_str'] = df['complaint_time'].dt.strftime('%Y-%m-%d')
+        weather_map = weather_df.set_index('date_str')
+        df['is_rainy'] = df['date_str'].map(weather_map['is_rainy']).fillna(False)
+        df['weather'] = df['date_str'].map(weather_map['weather']).fillna('unknown')
+        df['rain_intensity'] = df['date_str'].map(weather_map['rain_intensity']).fillna('none')
+        df = df.drop(columns=['date_str'])
+        return df

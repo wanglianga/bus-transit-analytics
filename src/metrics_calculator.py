@@ -15,6 +15,7 @@ class MetricsCalculator:
         swipe_df = cleaned_data['swipe']
         congestion_df = cleaned_data['congestion']
         complaint_df = cleaned_data['complaint']
+        weather_df = cleaned_data.get('weather', pd.DataFrame())
         skipped_stops_df = cleaned_data.get('skipped_stops', pd.DataFrame())
 
         metrics = {}
@@ -29,6 +30,12 @@ class MetricsCalculator:
         metrics['complaint_hotspots'] = self.identify_complaint_hotspots(complaint_df)
         metrics['delay_analysis'] = self.analyze_delays(
             stops_df, schedule_df, congestion_df, skipped_stops_df
+        )
+        metrics['period_segment_analysis'] = self.analyze_by_period_segment(
+            stops_df, schedule_df, swipe_df
+        )
+        metrics['rainy_day_comparison'] = self.analyze_rainy_day_comparison(
+            stops_df, swipe_df, complaint_df, congestion_df, weather_df
         )
         return metrics
 
@@ -335,3 +342,276 @@ class MetricsCalculator:
             by_cause['skip_route_summary'] = pd.DataFrame(skip_delay_routes)
 
         return by_cause
+
+    def _classify_period(self, hour, is_weekday):
+        if not is_weekday:
+            return 'weekend'
+        if 7 <= hour <= 9:
+            return 'morning_peak'
+        elif 17 <= hour <= 19:
+            return 'evening_peak'
+        else:
+            return 'off_peak'
+
+    def analyze_by_period_segment(self, stops_df, schedule_df, swipe_df):
+        result = {}
+        if stops_df.empty:
+            return result
+
+        df = stops_df.copy()
+        df['hour'] = df['arrival_time'].dt.hour
+        df['is_weekday'] = df['arrival_time'].dt.weekday < 5
+        df['period_segment'] = df.apply(
+            lambda r: self._classify_period(r['hour'], r['is_weekday']), axis=1
+        )
+
+        on_time = self.calculate_on_time_rate(stops_df, schedule_df)
+        on_time_detail = on_time['detail'].copy()
+        on_time_detail['hour'] = on_time_detail['arrival_time'].dt.hour
+        on_time_detail['is_weekday'] = on_time_detail['arrival_time'].dt.weekday < 5
+        on_time_detail['period_segment'] = on_time_detail.apply(
+            lambda r: self._classify_period(r['hour'], r['is_weekday']), axis=1
+        )
+
+        on_time_by_period = on_time_detail.groupby(
+            ['route_id', 'direction', 'period_segment']
+        ).agg(
+            on_time_count=('is_on_time', 'sum'),
+            total_count=('is_on_time', 'count'),
+            avg_deviation_seconds=('arrival_deviation', 'mean'),
+            late_count=('is_late', 'sum'),
+            early_count=('is_early', 'sum')
+        ).reset_index()
+        on_time_by_period['on_time_rate'] = (
+            on_time_by_period['on_time_count'] / on_time_by_period['total_count']
+        )
+        result['on_time_by_period'] = on_time_by_period
+
+        ist_detail = df.copy()
+        ist_detail = ist_detail.sort_values(
+            ['route_id', 'direction', 'trip_id', 'stop_sequence']
+        )
+        ist_detail['next_arrival'] = ist_detail.groupby(
+            ['route_id', 'direction', 'trip_id']
+        )['arrival_time'].shift(-1)
+        ist_detail['next_stop_seq'] = ist_detail.groupby(
+            ['route_id', 'direction', 'trip_id']
+        )['stop_sequence'].shift(-1)
+        ist_detail['run_time_seconds'] = (
+            ist_detail['next_arrival'] - ist_detail['departure_time']
+        ).dt.total_seconds()
+        ist_detail = ist_detail.dropna(subset=['run_time_seconds'])
+
+        ist_by_period = ist_detail.groupby(
+            ['route_id', 'direction', 'period_segment']
+        ).agg(
+            avg_run_time_sec=('run_time_seconds', 'mean'),
+            median_run_time_sec=('run_time_seconds', 'median'),
+            p95_run_time_sec=('run_time_seconds', lambda x: np.percentile(x, 95)),
+            sample_count=('run_time_seconds', 'count')
+        ).reset_index()
+        result['inter_stop_time_by_period'] = ist_by_period
+
+        if not swipe_df.empty:
+            swipe = swipe_df.copy()
+            swipe['hour'] = swipe['swipe_time'].dt.hour
+            swipe['is_weekday'] = swipe['swipe_time'].dt.weekday < 5
+            swipe['period_segment'] = swipe.apply(
+                lambda r: self._classify_period(r['hour'], r['is_weekday']), axis=1
+            )
+            swipe['date'] = swipe['swipe_time'].dt.date
+
+            load_by_period = swipe.groupby(
+                ['route_id', 'period_segment', 'date', 'hour']
+            ).agg(passenger_count=('card_id', 'nunique')).reset_index()
+
+            load_summary = load_by_period.groupby(
+                ['route_id', 'period_segment']
+            ).agg(
+                avg_hourly_passengers=('passenger_count', 'mean'),
+                max_hourly_passengers=('passenger_count', 'max'),
+                total_passengers=('passenger_count', 'sum')
+            ).reset_index()
+            result['load_factor_by_period'] = load_summary
+
+        headway_detail = df.copy()
+        headway_detail = headway_detail.sort_values(
+            ['route_id', 'direction', 'stop_id', 'arrival_time']
+        )
+        headway_detail['prev_arrival'] = headway_detail.groupby(
+            ['route_id', 'direction', 'stop_id']
+        )['arrival_time'].shift(1)
+        headway_detail['headway_seconds'] = (
+            headway_detail['arrival_time'] - headway_detail['prev_arrival']
+        ).dt.total_seconds()
+        headway_detail = headway_detail.dropna(subset=['headway_seconds'])
+
+        headway_by_period = headway_detail.groupby(
+            ['route_id', 'direction', 'period_segment']
+        ).agg(
+            avg_headway_sec=('headway_seconds', 'mean'),
+            median_headway_sec=('headway_seconds', 'median'),
+            headway_cv=('headway_seconds', lambda x: np.std(x) / np.mean(x) if np.mean(x) > 0 else 0),
+            sample_count=('headway_seconds', 'count')
+        ).reset_index()
+        result['headway_by_period'] = headway_by_period
+
+        return result
+
+    def analyze_rainy_day_comparison(self, stops_df, swipe_df, complaint_df,
+                                     congestion_df, weather_df):
+        result = {}
+        if weather_df.empty or stops_df.empty:
+            result['has_data'] = False
+            return result
+
+        result['has_data'] = True
+
+        stops = stops_df.copy()
+        if 'is_rainy' not in stops.columns:
+            stops['date_str'] = stops['arrival_time'].dt.strftime('%Y-%m-%d')
+            weather_map = weather_df.set_index('date_str')
+            stops['is_rainy'] = stops['date_str'].map(
+                weather_map['is_rainy']
+            ).fillna(False)
+            stops = stops.drop(columns=['date_str'])
+
+        stops_sorted = stops.sort_values(
+            ['route_id', 'direction', 'trip_id', 'stop_sequence']
+        )
+        stops_sorted['next_arrival'] = stops_sorted.groupby(
+            ['route_id', 'direction', 'trip_id']
+        )['arrival_time'].shift(-1)
+        stops_sorted['run_time_seconds'] = (
+            stops_sorted['next_arrival'] - stops_sorted['departure_time']
+        ).dt.total_seconds()
+        stops_sorted = stops_sorted.dropna(subset=['run_time_seconds'])
+
+        ist_by_weather = stops_sorted.groupby(
+            ['route_id', 'direction', 'is_rainy']
+        ).agg(
+            avg_run_time_sec=('run_time_seconds', 'mean'),
+            median_run_time_sec=('run_time_seconds', 'median'),
+            p95_run_time_sec=('run_time_seconds', lambda x: np.percentile(x, 95)),
+            sample_count=('run_time_seconds', 'count')
+        ).reset_index()
+        result['inter_stop_time_by_weather'] = ist_by_weather
+
+        rainy_ist = ist_by_weather[ist_by_weather['is_rainy'] == True].copy()
+        sunny_ist = ist_by_weather[ist_by_weather['is_rainy'] == False].copy()
+        if not rainy_ist.empty and not sunny_ist.empty:
+            ist_diff = rainy_ist.merge(
+                sunny_ist, on=['route_id', 'direction'], suffixes=('_rainy', '_sunny')
+            )
+            ist_diff['avg_time_increase_pct'] = (
+                (ist_diff['avg_run_time_sec_rainy'] - ist_diff['avg_run_time_sec_sunny'])
+                / ist_diff['avg_run_time_sec_sunny'] * 100
+            )
+            ist_diff['p95_time_increase_pct'] = (
+                (ist_diff['p95_run_time_sec_rainy'] - ist_diff['p95_run_time_sec_sunny'])
+                / ist_diff['p95_run_time_sec_sunny'] * 100
+            )
+            result['inter_stop_time_diff'] = ist_diff
+
+        if not swipe_df.empty:
+            swipe = swipe_df.copy()
+            if 'is_rainy' not in swipe.columns:
+                swipe['date_str'] = swipe['swipe_time'].dt.strftime('%Y-%m-%d')
+                weather_map = weather_df.set_index('date_str')
+                swipe['is_rainy'] = swipe['date_str'].map(
+                    weather_map['is_rainy']
+                ).fillna(False)
+                swipe = swipe.drop(columns=['date_str'])
+            swipe['date'] = swipe['swipe_time'].dt.date
+            swipe['hour'] = swipe['swipe_time'].dt.hour
+
+            hourly_load = swipe.groupby(
+                ['route_id', 'date', 'hour', 'is_rainy']
+            ).agg(passenger_count=('card_id', 'nunique')).reset_index()
+
+            load_by_weather = hourly_load.groupby(
+                ['route_id', 'is_rainy']
+            ).agg(
+                avg_hourly_passengers=('passenger_count', 'mean'),
+                max_hourly_passengers=('passenger_count', 'max'),
+                total_passengers=('passenger_count', 'sum'),
+                sample_hours=('passenger_count', 'count')
+            ).reset_index()
+            result['load_factor_by_weather'] = load_by_weather
+
+            rainy_load = load_by_weather[load_by_weather['is_rainy'] == True].copy()
+            sunny_load = load_by_weather[load_by_weather['is_rainy'] == False].copy()
+            if not rainy_load.empty and not sunny_load.empty:
+                load_diff = rainy_load.merge(
+                    sunny_load, on='route_id', suffixes=('_rainy', '_sunny')
+                )
+                load_diff['avg_load_increase_pct'] = (
+                    (load_diff['avg_hourly_passengers_rainy']
+                     - load_diff['avg_hourly_passengers_sunny'])
+                    / load_diff['avg_hourly_passengers_sunny'] * 100
+                )
+                result['load_factor_diff'] = load_diff
+
+        if not complaint_df.empty:
+            complaint = complaint_df.copy()
+            if 'is_rainy' not in complaint.columns:
+                complaint['date_str'] = complaint['complaint_time'].dt.strftime('%Y-%m-%d')
+                weather_map = weather_df.set_index('date_str')
+                complaint['is_rainy'] = complaint['date_str'].map(
+                    weather_map['is_rainy']
+                ).fillna(False)
+                complaint = complaint.drop(columns=['date_str'])
+            complaint['date'] = complaint['complaint_time'].dt.date
+
+            daily_complaints = complaint.groupby(
+                ['route_id', 'date', 'is_rainy']
+            ).agg(complaint_count=('complaint_id', 'count')).reset_index()
+
+            complaint_by_weather = daily_complaints.groupby(
+                ['route_id', 'is_rainy']
+            ).agg(
+                avg_daily_complaints=('complaint_count', 'mean'),
+                total_complaints=('complaint_count', 'sum'),
+                sample_days=('complaint_count', 'count')
+            ).reset_index()
+            result['complaints_by_weather'] = complaint_by_weather
+
+            rainy_comp = complaint_by_weather[complaint_by_weather['is_rainy'] == True].copy()
+            sunny_comp = complaint_by_weather[complaint_by_weather['is_rainy'] == False].copy()
+            if not rainy_comp.empty and not sunny_comp.empty:
+                comp_diff = rainy_comp.merge(
+                    sunny_comp, on='route_id', suffixes=('_rainy', '_sunny')
+                )
+                comp_diff['complaint_increase_pct'] = (
+                    (comp_diff['avg_daily_complaints_rainy']
+                     - comp_diff['avg_daily_complaints_sunny'])
+                    / comp_diff['avg_daily_complaints_sunny'] * 100
+                )
+                result['complaint_diff'] = comp_diff
+
+            complaint_type_by_weather = complaint.groupby(
+                ['route_id', 'complaint_type', 'is_rainy']
+            ).agg(complaint_count=('complaint_id', 'count')).reset_index()
+            result['complaint_type_by_weather'] = complaint_type_by_weather
+
+        if not congestion_df.empty:
+            congestion = congestion_df.copy()
+            if 'is_rainy' not in congestion.columns:
+                congestion['date_str'] = congestion['timestamp'].dt.strftime('%Y-%m-%d')
+                weather_map = weather_df.set_index('date_str')
+                congestion['is_rainy'] = congestion['date_str'].map(
+                    weather_map['is_rainy']
+                ).fillna(False)
+                congestion = congestion.drop(columns=['date_str'])
+
+            congestion_by_weather = congestion.groupby(
+                ['is_rainy']
+            ).agg(
+                avg_congestion_index=('congestion_index', 'mean'),
+                max_congestion_index=('congestion_index', 'max'),
+                severe_ratio=('congestion_index', lambda x: (x >= 8).sum() / len(x) if len(x) > 0 else 0),
+                sample_count=('congestion_index', 'count')
+            ).reset_index()
+            result['congestion_by_weather'] = congestion_by_weather
+
+        return result

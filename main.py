@@ -19,7 +19,8 @@ def load_data(data_dir='sample_data'):
         'swipe': 'swipe_data.csv',
         'schedule': 'schedule_data.csv',
         'congestion': 'congestion_data.csv',
-        'complaint': 'complaint_data.csv'
+        'complaint': 'complaint_data.csv',
+        'weather': 'weather_data.csv'
     }
     data = {}
     for key, fname in required_files.items():
@@ -28,7 +29,7 @@ def load_data(data_dir='sample_data'):
             df = pd.read_csv(fpath)
             for col in ['timestamp', 'arrival_time', 'departure_time',
                         'scheduled_arrival', 'scheduled_departure',
-                        'swipe_time', 'complaint_time', 'service_date']:
+                        'swipe_time', 'complaint_time', 'service_date', 'date']:
                 if col in df.columns:
                     df[col] = pd.to_datetime(df[col], errors='coerce')
             data[key] = df
@@ -103,6 +104,60 @@ def print_summary(results):
             if details:
                 detail_str = ', '.join([f"{k}={v}" for k, v in details.items()])
                 print(f"     详情: {detail_str}")
+
+        period_analysis = route_data.get('period_segment_comparison', {})
+        if period_analysis and period_analysis.get('segments'):
+            print("\n【时段分段对比】")
+            period_names = period_analysis.get('period_names', {})
+            ot_segments = period_analysis.get('segments', {}).get('on_time_rate', {})
+            if ot_segments:
+                print("  准点率:")
+                for seg_key, seg_data in ot_segments.items():
+                    name = period_names.get(seg_key, seg_key)
+                    print(f"    {name}: {round(seg_data['on_time_rate']*100, 1)}% "
+                          f"(平均偏差 {seg_data['avg_deviation_minutes']} 分钟)")
+            load_segments = period_analysis.get('segments', {}).get('load_factor', {})
+            if load_segments:
+                print("  平均小时客流:")
+                for seg_key, seg_data in load_segments.items():
+                    name = period_names.get(seg_key, seg_key)
+                    print(f"    {name}: {seg_data['avg_hourly_passengers']} 人次")
+            key_findings = period_analysis.get('key_findings', [])
+            if key_findings:
+                print("  关键发现:")
+                for finding in key_findings:
+                    print(f"    ! {finding}")
+
+        rainy_analysis = route_data.get('rainy_day_analysis', {})
+        if rainy_analysis and rainy_analysis.get('has_data'):
+            print("\n【雨天影响分析】")
+            ist_comp = rainy_analysis.get('inter_stop_time_comparison', {})
+            if ist_comp:
+                print(f"  站间耗时: 晴天 {ist_comp.get('sunny_avg_sec', 0)}s → "
+                      f"雨天 {ist_comp.get('rainy_avg_sec', 0)}s "
+                      f"(+{ist_comp.get('avg_time_increase_pct', 0)}%)")
+            load_comp = rainy_analysis.get('load_factor_comparison', {})
+            if load_comp:
+                print(f"  满载率: 晴天 {load_comp.get('sunny_avg_hourly', 0)} → "
+                      f"雨天 {load_comp.get('rainy_avg_hourly', 0)} "
+                      f"(+{load_comp.get('avg_load_increase_pct', 0)}%)")
+            comp_comp = rainy_analysis.get('complaint_comparison', {})
+            if comp_comp:
+                print(f"  投诉量: 晴天 {comp_comp.get('sunny_avg_daily', 0)}/天 → "
+                      f"雨天 {comp_comp.get('rainy_avg_daily', 0)}/天 "
+                      f"(+{comp_comp.get('complaint_increase_pct', 0)}%)")
+            top_rainy_complaints = rainy_analysis.get('top_rainy_complaint_types', [])
+            if top_rainy_complaints:
+                print(f"  雨天高发投诉类型: {', '.join(top_rainy_complaints)}")
+            recommendations = rainy_analysis.get('recommendations', [])
+            if recommendations:
+                print("  建议:")
+                for rec in recommendations:
+                    print(f"    → {rec}")
+            severity = rainy_analysis.get('summary', {}).get('severity', 'unknown')
+            needs_extra = rainy_analysis.get('needs_rainy_extra_service', False)
+            if needs_extra:
+                print(f"  ⚠ 建议雨天临时加密班次 (影响程度: {severity})")
     if 'route_metrics' in results:
         rm = results['route_metrics']
         print("\n" + "-"*70)
@@ -145,6 +200,7 @@ def run_analysis(data_dir='sample_data', output_dir='output'):
         schedule_data=raw_data.get('schedule', pd.DataFrame()),
         congestion_data=raw_data.get('congestion', pd.DataFrame()),
         complaint_data=raw_data.get('complaint', pd.DataFrame()),
+        weather_data=raw_data.get('weather', pd.DataFrame()),
         holidays=holidays
     )
     print("\n[3/4] 计算指标...")
